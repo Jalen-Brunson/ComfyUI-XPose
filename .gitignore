@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Third-party source cloned at runtime (not our code, not our license)
+xpose_src/
+
+# Model checkpoints and compiled artifacts
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.so
+build/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
