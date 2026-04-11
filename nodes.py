@@ -93,6 +93,64 @@ _DOWNLOAD_HINT = (
     "(Google Drive / OpenXLab) and place it at:\n  {path}\n"
 )
 
+# Unofficial HF mirror of IDEA's unipose_swint.pth. NOT maintained by IDEA.
+# Auto-download is opt-out via env var so nothing happens behind a user's back
+# if they prefer to fetch the official copy themselves.
+_HF_MIRROR_REPO = "OwlMaster/XPose"
+_HF_MIRROR_FILE = "unipose_swint.pth"
+
+
+def _maybe_download_checkpoint(target_path: str) -> bool:
+    """Try to fetch unipose_swint.pth from the HF mirror if missing.
+
+    Returns True if the file is present after the call (either pre-existing
+    or freshly downloaded). Set COMFYUI_XPOSE_NO_AUTODOWNLOAD=1 to disable.
+    """
+    if os.path.isfile(target_path):
+        return True
+    if os.environ.get("COMFYUI_XPOSE_NO_AUTODOWNLOAD") == "1":
+        return False
+    if os.path.basename(target_path) != _HF_MIRROR_FILE:
+        return False  # don't auto-fetch arbitrary filenames
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore
+    except Exception as e:
+        print(
+            f"[ComfyUI-XPose] huggingface_hub not available ({e}); "
+            "skipping auto-download",
+            flush=True,
+        )
+        return False
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    print(
+        f"[ComfyUI-XPose] checkpoint missing at {target_path}\n"
+        f"[ComfyUI-XPose] auto-downloading from unofficial HF mirror "
+        f"{_HF_MIRROR_REPO}/{_HF_MIRROR_FILE} (~1.3 GB, one-time)...\n"
+        f"[ComfyUI-XPose]   (set COMFYUI_XPOSE_NO_AUTODOWNLOAD=1 to disable)",
+        flush=True,
+    )
+    try:
+        downloaded = hf_hub_download(
+            repo_id=_HF_MIRROR_REPO,
+            filename=_HF_MIRROR_FILE,
+            local_dir=target_dir,
+        )
+    except Exception as e:
+        print(f"[ComfyUI-XPose] auto-download failed: {e}", flush=True)
+        return False
+    # hf_hub_download may place the file under its own filename; ensure it
+    # ends up at the exact target path.
+    if os.path.abspath(downloaded) != os.path.abspath(target_path):
+        try:
+            os.replace(downloaded, target_path)
+        except Exception:
+            pass
+    ok = os.path.isfile(target_path)
+    if ok:
+        print(f"[ComfyUI-XPose] checkpoint ready at {target_path}", flush=True)
+    return ok
+
 
 def _list_checkpoints() -> list[str]:
     if folder_paths is not None:
@@ -678,10 +736,21 @@ class XPoseModelLoader:
     ):
         ckpt_path = _resolve_checkpoint(checkpoint)
         if not os.path.isfile(ckpt_path):
-            raise FileNotFoundError(
-                f"X-Pose checkpoint not found: {ckpt_path}"
-                + _DOWNLOAD_HINT.format(path=os.path.join(_MODELS_DIR, "unipose_swint.pth"))
+            # If user picked the default name, try the HF mirror auto-download.
+            target = (
+                ckpt_path
+                if os.path.basename(ckpt_path) == _HF_MIRROR_FILE
+                else os.path.join(_MODELS_DIR, _HF_MIRROR_FILE)
             )
+            if _maybe_download_checkpoint(target):
+                ckpt_path = target
+            else:
+                raise FileNotFoundError(
+                    f"X-Pose checkpoint not found: {ckpt_path}"
+                    + _DOWNLOAD_HINT.format(
+                        path=os.path.join(_MODELS_DIR, _HF_MIRROR_FILE)
+                    )
+                )
 
         cfg = Config.fromfile(_CONFIG_PATH)
         cfg.device = device
