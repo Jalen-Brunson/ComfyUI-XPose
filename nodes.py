@@ -803,16 +803,6 @@ class XPoseEstimator:
                     "BOOLEAN",
                     {"default": False, "tooltip": "Extra pass with category=hand (21 pts)"},
                 ),
-                "detect_feet": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": (
-                            "X-Pose person skeleton ends at ankles. "
-                            "Enable only if you add toe keypoints via custom_keypoint_prompt."
-                        ),
-                    },
-                ),
                 "box_threshold": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "iou_threshold": ("FLOAT", {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "max_instances": ("INT", {"default": 0, "min": 0, "max": 100}),
@@ -954,7 +944,6 @@ class XPoseEstimator:
         detect_body: bool,
         detect_face: bool,
         detect_hands: bool,
-        detect_feet: bool,
         box_threshold: float,
         iou_threshold: float,
         max_instances: int,
@@ -994,15 +983,6 @@ class XPoseEstimator:
         if detect_hands and "hand" in CATEGORY_PRESETS:
             p = CATEGORY_PRESETS["hand"]
             passes.append(("hand", "hand", list(p["keypoints"]), [list(s) for s in p["skeleton"]]))
-        if detect_feet:
-            print(
-                "[ComfyUI-XPose] detect_feet: X-Pose has no predefined foot skeleton; "
-                "using experimental custom prompt.",
-                flush=True,
-            )
-            foot_kpts = ["left big toe", "left small toe", "left heel",
-                         "right big toe", "right small toe", "right heel"]
-            passes.append(("person", main_instance, foot_kpts, []))
 
         if not passes:
             raise ValueError("At least one of detect_body/face/hands must be enabled.")

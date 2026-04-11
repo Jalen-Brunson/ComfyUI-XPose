@@ -73,7 +73,6 @@ Runs detection on an `IMAGE` batch. Returns a rendered pose `IMAGE` batch plus `
 | `detect_body` | True | runs the primary preset pass |
 | `detect_face` | False | extra pass with `face` preset (68 kpts) |
 | `detect_hands` | False | extra pass with `hand` preset (21 kpts × 2) |
-| `detect_feet` | False | experimental, no predefined toe skeleton |
 | `box_threshold` | 0.10 | detection confidence cutoff |
 | `iou_threshold` | 0.90 | NMS |
 | `max_instances` | 0 | cap detections per frame (0 = no cap) |
@@ -143,7 +142,6 @@ Use X-Pose when you need the best quality on difficult poses, face, and hands, o
 
 - Per-frame detector with no native temporal component. The tracker + smoother we wrap around it help, but they're post-processing — they can't recover information the model didn't see.
 - X-Pose's 17-point `person` skeleton is COCO-17 style (stops at ankles). There are no toe or foot keypoints in the predefined presets.
-- `detect_feet` uses an experimental custom keypoint prompt and is not validated.
 - The MSDeformAttn CUDA op from X-Pose's vendored source won't build on modern PyTorch without a small patch. We ship a pure-PyTorch `grid_sample` fallback (`msdeform_shim.py`) that is slightly *faster* than the real op on H200. If you're on an older GPU where the custom kernel would win, set `COMFYUI_XPOSE_USE_CUDA_OP=1` and build `xpose_src/models/UniPose/ops/` manually.
 
 ## Acknowledgments
