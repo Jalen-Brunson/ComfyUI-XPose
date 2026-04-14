@@ -12,6 +12,8 @@ Forward-only. Inference nodes do not need a backward pass.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
 import sys
 import types
 
@@ -19,7 +21,30 @@ import torch
 import torch.nn.functional as F
 
 
-def _ms_deform_attn_forward(
+_FAST_MOD = None
+_FAST_LOAD_ERR = None
+
+
+def _load_fast_mod():
+    global _FAST_MOD, _FAST_LOAD_ERR
+    if _FAST_MOD is not None or _FAST_LOAD_ERR is not None:
+        return _FAST_MOD
+    path = "/workspace/ms_deform_attn_fast.py"
+    try:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        spec = importlib.util.spec_from_file_location("ms_deform_attn_fast", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _FAST_MOD = mod
+        print(f"[ComfyUI-XPose shim] loaded fast deform-attn from {path}")
+    except Exception as e:
+        _FAST_LOAD_ERR = e
+        print(f"[ComfyUI-XPose shim] fast deform-attn unavailable ({e!r}); using grid_sample fallback")
+    return _FAST_MOD
+
+
+def _grid_sample_loop_forward(
     value: torch.Tensor,
     value_spatial_shapes: torch.Tensor,
     value_level_start_index: torch.Tensor,
@@ -66,6 +91,51 @@ def _ms_deform_attn_forward(
         .view(N_, M_ * D_, Lq_)
     )
     return output.transpose(1, 2).contiguous()
+
+
+_GATHER_FAILED = True  # gather path is slower than batched grid_sample on H200 — skip
+
+
+def _ms_deform_attn_forward(
+    value: torch.Tensor,
+    value_spatial_shapes: torch.Tensor,
+    value_level_start_index: torch.Tensor,
+    sampling_locations: torch.Tensor,
+    attention_weights: torch.Tensor,
+    im2col_step: int,
+) -> torch.Tensor:
+    global _GATHER_FAILED
+    fast = _load_fast_mod()
+    if fast is not None and not _GATHER_FAILED:
+        try:
+            return fast.multi_scale_deformable_attn_gather(
+                value,
+                value_spatial_shapes,
+                value_level_start_index,
+                sampling_locations,
+                attention_weights,
+            )
+        except Exception as e:
+            _GATHER_FAILED = True
+            print(f"[ComfyUI-XPose shim] gather path failed ({e!r}); falling back to batched grid_sample")
+    if fast is not None:
+        try:
+            return fast.multi_scale_deformable_attn_fast(
+                value,
+                value_spatial_shapes,
+                sampling_locations,
+                attention_weights,
+            )
+        except Exception as e:
+            print(f"[ComfyUI-XPose shim] batched grid_sample failed ({e!r}); falling back to per-level loop")
+    return _grid_sample_loop_forward(
+        value,
+        value_spatial_shapes,
+        value_level_start_index,
+        sampling_locations,
+        attention_weights,
+        im2col_step,
+    )
 
 
 def _ms_deform_attn_backward(*args, **kwargs):

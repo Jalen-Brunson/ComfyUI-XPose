@@ -776,6 +776,28 @@ class XPoseModelLoader:
         dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
         dtype = dtype_map[precision]
 
+        if os.environ.get("COMFYUI_XPOSE_FP8") == "1":
+            try:
+                from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
+                # Skip the MSDeformAttn projections — the native CUDA kernel only supports Half/BFloat16.
+                # Quantize the rest (Swin, encoder/decoder MLPs, keypoint heads) which is where most FLOPs live.
+                def _filter_no_msdeform(mod, fqn):
+                    import torch.nn as nn
+                    if not isinstance(mod, nn.Linear):
+                        return False
+                    return "MSDeformAttn" not in fqn and "ms_deform" not in fqn
+                quantize_(model, Float8DynamicActivationFloat8WeightConfig(), filter_fn=_filter_no_msdeform)
+                print("[ComfyUI-XPose] fp8 (e4m3 dynamic-act/fp8-weight) applied to non-MSDeformAttn Linear layers", flush=True)
+            except Exception as e:
+                print(f"[ComfyUI-XPose] fp8 disabled ({e!r})", flush=True)
+
+        if os.environ.get("COMFYUI_XPOSE_COMPILE") == "1":
+            try:
+                model = torch.compile(model, mode="max-autotune-no-cudagraphs", dynamic=True)
+                print("[ComfyUI-XPose] torch.compile enabled (max-autotune-no-cudagraphs, dynamic)", flush=True)
+            except Exception as e:
+                print(f"[ComfyUI-XPose] torch.compile disabled ({e!r})", flush=True)
+
         bundle = XPoseBundle(
             model=model,
             device=torch_device,
