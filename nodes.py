@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
+from scipy.optimize import linear_sum_assignment
 
 from . import xpose_runtime
 
@@ -325,40 +326,37 @@ def _get_or_build_target(
     return cached
 
 
-def _iou_cxcywh(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """IoU between two [N,4] / [M,4] cxcywh tensors. Returns [N,M]."""
-    if a.numel() == 0 or b.numel() == 0:
-        return torch.zeros(a.shape[0], b.shape[0])
-    ax1 = a[:, 0] - a[:, 2] / 2
-    ay1 = a[:, 1] - a[:, 3] / 2
-    ax2 = a[:, 0] + a[:, 2] / 2
-    ay2 = a[:, 1] + a[:, 3] / 2
-    bx1 = b[:, 0] - b[:, 2] / 2
-    by1 = b[:, 1] - b[:, 3] / 2
-    bx2 = b[:, 0] + b[:, 2] / 2
-    by2 = b[:, 1] + b[:, 3] / 2
-    ix1 = torch.maximum(ax1[:, None], bx1[None, :])
-    iy1 = torch.maximum(ay1[:, None], by1[None, :])
-    ix2 = torch.minimum(ax2[:, None], bx2[None, :])
-    iy2 = torch.minimum(ay2[:, None], by2[None, :])
-    iw = (ix2 - ix1).clamp(min=0)
-    ih = (iy2 - iy1).clamp(min=0)
-    inter = iw * ih
-    area_a = ((ax2 - ax1).clamp(min=0) * (ay2 - ay1).clamp(min=0))[:, None]
-    area_b = ((bx2 - bx1).clamp(min=0) * (by2 - by1).clamp(min=0))[None, :]
-    union = area_a + area_b - inter
-    return torch.where(union > 0, inter / union, torch.zeros_like(inter))
-
-
 class _Tracker:
-    """Per-category greedy IoU tracker with EMA smoothing and dropout hold."""
+    """Per-category Hungarian tracker with EMA smoothing and dropout hold.
 
-    def __init__(self, iou_thresh: float, alpha: float, hold_frames: int):
-        self.iou_thresh = float(iou_thresh)
+    Matches detections to existing tracks by centroid distance normalized by
+    each track's bbox diagonal, which is more robust than IoU for small or
+    fast-moving boxes (faces, hands) where even modest motion drops IoU to ~0.
+    """
+
+    def __init__(self, match_gate: float, alpha: float, hold_frames: int):
+        self.match_gate = float(match_gate)
         self.alpha = float(alpha)  # weight of previous value (0 = no smoothing)
         self.hold_frames = int(hold_frames)
         self._tracks: list[dict] = []  # {box:[4], kpts:[K,3], missing:int, id:int}
         self._next_id = 0
+        # Diagnostic counters (visible via `stats()`). Useful for confirming the
+        # tracker is actually matching instead of spawning a new ID every frame.
+        self.n_detections = 0
+        self.n_matched = 0
+        self.n_new = 0
+        self.n_held = 0
+
+    def stats(self) -> dict:
+        det = max(1, self.n_detections)
+        return {
+            "detections": self.n_detections,
+            "matched": self.n_matched,
+            "new_ids_spawned": self.n_new,
+            "held_frames": self.n_held,
+            "match_rate": self.n_matched / det,
+            "total_ids": self._next_id,
+        }
 
     def update(
         self, boxes: torch.Tensor, kpts: torch.Tensor
@@ -372,29 +370,32 @@ class _Tracker:
         match_new_to_prev: dict[int, int] = {}
         match_prev_to_new: dict[int, int] = {}
         if N > 0 and prev_boxes.shape[0] > 0:
-            ious = _iou_cxcywh(boxes, prev_boxes)  # [N, P]
-            flat = [
-                (float(ious[i, j]), i, j)
-                for i in range(ious.shape[0])
-                for j in range(ious.shape[1])
-                if float(ious[i, j]) >= self.iou_thresh
-            ]
-            flat.sort(key=lambda x: -x[0])
-            used_new: set[int] = set()
-            used_prev: set[int] = set()
-            for _score, i, j in flat:
-                if i in used_new or j in used_prev:
+            # Boxes are in normalized cxcywh. Distance + gate are also normalized.
+            dx = boxes[:, 0:1] - prev_boxes[:, 0].unsqueeze(0)  # [N, P]
+            dy = boxes[:, 1:2] - prev_boxes[:, 1].unsqueeze(0)  # [N, P]
+            dist = torch.sqrt(dx * dx + dy * dy)
+            prev_diag = torch.sqrt(
+                prev_boxes[:, 2] ** 2 + prev_boxes[:, 3] ** 2
+            ).clamp(min=1e-6)  # [P]
+            gate = (prev_diag * self.match_gate).unsqueeze(0)  # [1, P]
+            LARGE = 1e6
+            cost_t = torch.where(dist > gate, torch.full_like(dist, LARGE), dist)
+            cost_np = cost_t.detach().cpu().numpy()
+            row_ind, col_ind = linear_sum_assignment(cost_np)
+            for i, j in zip(row_ind, col_ind):
+                if cost_np[i, j] >= LARGE:
                     continue
-                used_new.add(i)
-                used_prev.add(j)
-                match_new_to_prev[i] = j
-                match_prev_to_new[j] = i
+                match_new_to_prev[int(i)] = int(j)
+                match_prev_to_new[int(j)] = int(i)
 
         a = self.alpha
         new_tracks: list[dict] = []
         # Matched + new (emitted in stable order: existing tracks first, then new)
         emit_boxes: list[torch.Tensor] = []
         emit_kpts: list[torch.Tensor] = []
+
+        self.n_detections += N
+        self.n_matched += len(match_prev_to_new)
 
         for j, t in enumerate(prev):
             if j in match_prev_to_new:
@@ -421,6 +422,7 @@ class _Tracker:
                     new_tracks.append(t)
                     emit_boxes.append(t["box"])
                     emit_kpts.append(t["kpts"])
+                    self.n_held += 1
                 # else: drop the track silently
 
         for i in range(N):
@@ -433,6 +435,7 @@ class _Tracker:
                 "id": self._next_id,
             }
             self._next_id += 1
+            self.n_new += 1
             new_tracks.append(t)
             emit_boxes.append(t["box"])
             emit_kpts.append(t["kpts"])
@@ -490,35 +493,38 @@ def _postprocess_one(
     return boxes, kp_xyv, scores
 
 
-def _forward_chunk(
+def _forward_prepared(
     bundle: XPoseBundle,
-    pil_frames: list[Image.Image],
+    normed: list[torch.Tensor],
+    stacked: torch.Tensor | None,
     target: dict[str, Any],
     num_keypoints: int,
     box_threshold: float,
     iou_threshold: float,
     max_instances: int,
-    short_edge: int = 800,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Batched forward pass. Returns per-frame (boxes, kp_xyv, scores)."""
-    device = bundle.device
-    normed = [_prepare_input(p, short_edge) for p in pil_frames]
-    shapes = {tuple(t.shape) for t in normed}
+    """Batched forward pass over pre-prepared input tensors.
 
-    def _one_forward(stacked: torch.Tensor) -> dict:
-        targets_list = [target] * stacked.shape[0]
+    Passing the same `stacked` tensor across multiple calls is what lets
+    `_backbone_cache` (keyed on tensor data_ptr) actually hit — previously the
+    outer loop rebuilt `stacked` per pass, making the cache dead code.
+    Set `stacked=None` to fall back to per-frame forwards (mixed shapes).
+    """
+    device = bundle.device
+
+    def _one_forward(s: torch.Tensor) -> dict:
+        targets_list = [target] * s.shape[0]
         with torch.inference_mode():
             with torch.autocast(
                 device_type="cuda" if device.type == "cuda" else "cpu",
                 dtype=bundle.dtype,
                 enabled=bundle.dtype in (torch.float16, torch.bfloat16),
             ):
-                return bundle.model(stacked, targets_list)
+                return bundle.model(s, targets_list)
 
     results: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    if len(shapes) > 1:
-        # Mixed-shape fallback: one frame at a time.
+    if stacked is None:
         for t in normed:
             outputs = _one_forward(t.unsqueeze(0).to(device))
             logits = outputs["pred_logits"].sigmoid()[0].cpu()
@@ -532,7 +538,6 @@ def _forward_chunk(
             )
         return results
 
-    stacked = torch.stack(normed, dim=0).to(device)
     outputs = _one_forward(stacked)
     pred_logits = outputs["pred_logits"].sigmoid().cpu()
     pred_boxes = outputs["pred_boxes"].cpu()
@@ -858,14 +863,18 @@ class XPoseEstimator:
                         "tooltip": "0 = no smoothing, higher = more temporal inertia.",
                     },
                 ),
-                "tracking_iou": (
+                "match_gate": (
                     "FLOAT",
                     {
-                        "default": 0.3,
+                        "default": 0.5,
                         "min": 0.0,
-                        "max": 1.0,
+                        "max": 2.0,
                         "step": 0.05,
-                        "tooltip": "Min bbox IoU to match a detection to an existing track.",
+                        "tooltip": (
+                            "Max centroid shift per frame as a fraction of the track's bbox diag. "
+                            "Higher = more permissive matching. ~0.3 for slow scenes, 0.5 typical, "
+                            "0.8+ for fast-moving hands or crossing subjects."
+                        ),
                     },
                 ),
                 "hold_on_dropout_frames": (
@@ -978,7 +987,7 @@ class XPoseEstimator:
         point_radius: int,
         temporal_smoothing: bool = False,
         smoothing_strength: float = 0.6,
-        tracking_iou: float = 0.3,
+        match_gate: float = 0.5,
         hold_on_dropout_frames: int = 2,
         batch_size: int = 1,
         resize_short_edge: int = 800,
@@ -1023,7 +1032,7 @@ class XPoseEstimator:
         if temporal_smoothing:
             for pass_idx in range(len(passes)):
                 trackers[pass_idx] = _Tracker(
-                    iou_thresh=tracking_iou,
+                    match_gate=match_gate,
                     alpha=smoothing_strength,
                     hold_frames=hold_on_dropout_frames,
                 )
@@ -1040,10 +1049,16 @@ class XPoseEstimator:
         bs = max(1, int(batch_size))
         log_every = max(1, B // 20) if B >= 20 else 1
         t_start = time.time()
+        tracking_str = (
+            f"on (gate={match_gate}, alpha={smoothing_strength}, hold={hold_on_dropout_frames})"
+            if temporal_smoothing
+            else "OFF"
+        )
         print(
             f"[ComfyUI-XPose] estimating {B} frame(s), passes={len(passes)}, "
             f"batch_size={bs}, short_edge={resize_short_edge}, "
-            f"backbone_cache={'on' if cache_backbone_across_passes and len(passes) > 1 else 'off'}",
+            f"backbone_cache={'on' if cache_backbone_across_passes and len(passes) > 1 else 'off'}, "
+            f"tracking={tracking_str}",
             flush=True,
         )
 
@@ -1052,8 +1067,16 @@ class XPoseEstimator:
             chunk_end = min(chunk_start + bs, B)
             chunk_pils = [_tensor_to_pil(image[b]) for b in range(chunk_start, chunk_end)]
 
-            # Run every pass on the chunk. Backbone cache collapses the Swin
-            # forward across the multi-pass sequence for identical image tensors.
+            # Build input tensors ONCE per chunk so all passes share the same
+            # `stacked` (same data_ptr) and the backbone cache can hit.
+            chunk_normed = [_prepare_input(p, resize_short_edge) for p in chunk_pils]
+            chunk_shapes = {tuple(t.shape) for t in chunk_normed}
+            chunk_stacked = (
+                torch.stack(chunk_normed, dim=0).to(xpose_model.device)
+                if len(chunk_shapes) == 1
+                else None
+            )
+
             use_bb_cache = cache_backbone_across_passes and len(passes) > 1
             bb_ctx = (
                 _backbone_cache(xpose_model.model)
@@ -1063,15 +1086,15 @@ class XPoseEstimator:
             pass_chunk_results: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
             with bb_ctx:
                 for p_idx, (_cat_key, _instance, kpts, _skel) in enumerate(passes):
-                    chunk_dets = _forward_chunk(
+                    chunk_dets = _forward_prepared(
                         xpose_model,
-                        chunk_pils,
+                        chunk_normed,
+                        chunk_stacked,
                         pass_targets[p_idx],
                         num_keypoints=len(kpts),
                         box_threshold=box_threshold,
                         iou_threshold=iou_threshold,
                         max_instances=max_instances,
-                        short_edge=resize_short_edge,
                     )
                     pass_chunk_results.append(chunk_dets)
 
@@ -1139,6 +1162,18 @@ class XPoseEstimator:
                         f"elapsed {elapsed:.1f}s  eta {eta:.1f}s",
                         flush=True,
                     )
+
+        if temporal_smoothing and trackers:
+            for p_idx, (cat_key, _instance, _kpts, _skel) in enumerate(passes):
+                s = trackers[p_idx].stats()
+                print(
+                    f"[ComfyUI-XPose] tracker[{cat_key}] "
+                    f"dets={s['detections']} matched={s['matched']} "
+                    f"match_rate={s['match_rate']:.1%} "
+                    f"new_ids={s['new_ids_spawned']} held_frames={s['held_frames']} "
+                    f"total_ids={s['total_ids']}",
+                    flush=True,
+                )
 
         if out_images:
             heights = {t.shape[0] for t in out_images}
