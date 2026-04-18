@@ -796,12 +796,14 @@ class XPoseModelLoader:
             except Exception as e:
                 print(f"[ComfyUI-XPose] fp8 disabled ({e!r})", flush=True)
 
-        if os.environ.get("COMFYUI_XPOSE_COMPILE") == "1":
+        if os.environ.get("COMFYUI_XPOSE_COMPILE") == "1" and os.environ.get("COMFYUI_XPOSE_COMPILE_FORCE") == "1":
             try:
                 model = torch.compile(model, mode="max-autotune-no-cudagraphs", dynamic=True)
                 print("[ComfyUI-XPose] torch.compile enabled (max-autotune-no-cudagraphs, dynamic)", flush=True)
             except Exception as e:
                 print(f"[ComfyUI-XPose] torch.compile disabled ({e!r})", flush=True)
+        else:
+            print("[ComfyUI-XPose] torch.compile skipped (code-level disable; set COMFYUI_XPOSE_COMPILE_FORCE=1 to re-enable)", flush=True)
 
         bundle = XPoseBundle(
             model=model,
